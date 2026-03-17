@@ -105,6 +105,12 @@ class LincolnLayout(Widget):
         callback=lambda val: self._params.put_bool("CurveSpeedControl", val),
       ),
       self._curve_method_setting,
+      toggle_item(
+        title=lambda: tr("Curve Detection Failsafe"),
+        description=lambda: tr("Only trigger <b>Curve Speed Control</b> if a curve is detected with the model while using the <b>Map-Based</b> method. Useful to help prevent false positives."),
+        initial_state=self._params.get_bool("MTSCCurvatureCheck"),
+        callback=lambda val: self._params.put_bool("MTSCCurvatureCheck", val),
+      ),
       spin_button_item(
         title=lambda: tr("Curve Detection Sensitivity"),
         description=lambda: tr("How sensitive openpilot is when detecting curves. Higher values trigger earlier responses at the risk of triggering too often, while lower values increase confidence at the risk of triggering too infrequently."),
@@ -192,6 +198,19 @@ class LincolnLayout(Widget):
         step=0.1,
         decimals=1,
         suffix=tr(" m"),
+      ),
+      simple_item(title=lambda: tr("### HUD & Visualization ###")),
+      toggle_item(
+        title=lambda: tr("HUD drawing enhancements"),
+        description=lambda: tr("Enable enhanced HUD visuals (blindspot zones, clearer lane lines, brake cues)."),
+        initial_state=self._params.get_bool("dp_lincoln_hud_enhanced"),
+        callback=lambda val: self._params.put_bool("dp_lincoln_hud_enhanced", val),
+      ),
+      toggle_item(
+        title=lambda: tr("Show performance info"),
+        description=lambda: tr("Display device performance information at the bottom: CPU temperature, memory usage, CPU usage, and FPS. Requires UI restart."),
+        initial_state=self._params.get_bool("dp_lincoln_perf_info_enabled"),
+        callback=lambda val: self._params.put_bool("dp_lincoln_perf_info_enabled", val),
       ),
       button_item(
         title=lambda: tr("NAS (Synology) configuration"),

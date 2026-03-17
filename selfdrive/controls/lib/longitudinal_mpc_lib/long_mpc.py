@@ -58,7 +58,6 @@ COMFORT_BRAKE = 2.5
 STOP_DISTANCE = 3.0
 CRUISE_MIN_ACCEL = -1.2
 CRUISE_MAX_ACCEL = 3.0
-
 def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
     return 1.0
@@ -72,13 +71,14 @@ def get_jerk_factor(personality=log.LongitudinalPersonality.standard):
 
 def get_T_FOLLOW(personality=log.LongitudinalPersonality.standard):
   if personality==log.LongitudinalPersonality.relaxed:
-    return 1.1
+    return 1.2
   elif personality==log.LongitudinalPersonality.standard:
     return 0.8
   elif personality==log.LongitudinalPersonality.aggressive:
-    return 0.6
+    return 0.5
   else:
     raise NotImplementedError("Longitudinal personality not supported")
+
 
 def get_stopped_equivalence_factor(v_lead):
   return (v_lead**2) / (2 * COMFORT_BRAKE)

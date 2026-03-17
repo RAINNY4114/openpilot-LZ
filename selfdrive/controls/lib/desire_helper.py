@@ -60,15 +60,15 @@ class DesireHelper:
   def get_lane_change_direction(CS):
     return LaneChangeDirection.left if CS.leftBlinker else LaneChangeDirection.right
 
-  def update(self, carstate, lateral_active, lane_change_prob, left_edge_detected, right_edge_detected,
+  def update(self, navi, carstate, lateral_active, lane_change_prob, left_edge_detected, right_edge_detected,
              auto_lane_change_direction: LaneChangeDirection = LaneChangeDirection.none,
              auto_confirm_delay_sec: float | None = None):
     v_ego = carstate.vEgo
     one_blinker = carstate.leftBlinker != carstate.rightBlinker
     self.lane_turn_controller.update_params()
     self.lane_turn_controller.update_lane_turn(
-      blindspot_left=carstate.leftBlindspot,
-      blindspot_right=carstate.rightBlindspot,
+      blindspot_left=carstate.leftBlindspot or navi.leftBlind,
+      blindspot_right=carstate.rightBlindspot or navi.leftBlind,
       left_blinker=carstate.leftBlinker,
       right_blinker=carstate.rightBlinker,
       v_ego=v_ego,
@@ -120,8 +120,8 @@ class DesireHelper:
                          ((carstate.steeringTorque > 0 and self.lane_change_direction == LaneChangeDirection.left) or
                           (carstate.steeringTorque < 0 and self.lane_change_direction == LaneChangeDirection.right))
 
-        blindspot_detected = (((carstate.leftBlindspot or left_edge_detected) and self.lane_change_direction == LaneChangeDirection.left) or
-                              ((carstate.rightBlindspot or right_edge_detected) and self.lane_change_direction == LaneChangeDirection.right))
+        blindspot_detected = (((carstate.leftBlindspot or left_edge_detected or navi.leftBlind) and self.lane_change_direction == LaneChangeDirection.left) or
+                              ((carstate.rightBlindspot or right_edge_detected or navi.leftBlind) and self.lane_change_direction == LaneChangeDirection.right))
 
         if self._auto_requested and not blindspot_detected and (c_time - self._auto_request_start_t) >= auto_start_delay:
           torque_applied = True

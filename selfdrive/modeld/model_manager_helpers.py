@@ -7,7 +7,7 @@ from cereal import custom
 from openpilot.common.params import Params
 from openpilot.system.hardware.hw import Paths
 
-CURRENT_SELECTOR_VERSION = 15
+CURRENT_SELECTOR_VERSION = 13
 REQUIRED_MIN_SELECTOR_VERSION = 12
 
 ModelManager = custom.ModelManagerSP
@@ -44,13 +44,6 @@ def _normalize_bundle_dict(bundle: dict) -> dict:
   if "minimum_selector_version" in normalized and "minimumSelectorVersion" not in normalized:
     normalized["minimumSelectorVersion"] = normalized.pop("minimum_selector_version")
 
-  # Convert runner enum string to integer for capnp compatibility
-  if "runner" in normalized:
-    runner = normalized["runner"]
-    if isinstance(runner, str):
-      runner_map = {"snpe": 0, "tinygrad": 1, "stock": 2}
-      normalized["runner"] = runner_map.get(runner.lower(), 2)  # default to stock
-
   models = normalized.get("models")
   if isinstance(models, list):
     normalized_models = []
@@ -59,10 +52,6 @@ def _normalize_bundle_dict(bundle: dict) -> dict:
         normalized_models.append(model)
         continue
       model_out = dict(model)
-      # Convert model type enum string to integer
-      if "type" in model_out and isinstance(model_out["type"], str):
-        type_map = {"supercombo": 0, "navigation": 1, "vision": 2, "policy": 3, "offPolicy": 4, "offpolicy": 4}
-        model_out["type"] = type_map.get(model_out["type"], 0)
       for key in ("artifact", "metadata"):
         artifact = model_out.get(key)
         if isinstance(artifact, dict):
@@ -79,12 +68,6 @@ def _normalize_bundle_dict(bundle: dict) -> dict:
             if "url" in uri_out and "uri" not in uri_out:
               uri_out["uri"] = uri_out.pop("url")
             art_out["downloadUri"] = uri_out
-          # Convert status enum string to integer
-          if "downloadProgress" in art_out and isinstance(art_out["downloadProgress"], dict):
-            dp = art_out["downloadProgress"]
-            if "status" in dp and isinstance(dp["status"], str):
-              status_map = {"notDownloading": 0, "downloading": 1, "downloaded": 2, "cached": 3, "failed": 4}
-              dp["status"] = status_map.get(dp["status"], 0)
           model_out[key] = art_out
       normalized_models.append(model_out)
     normalized["models"] = normalized_models
@@ -103,12 +86,6 @@ def _normalize_bundle_dict(bundle: dict) -> dict:
         normalized_overrides.append({"key": str(key), "value": str(value)})
     if normalized_overrides:
       normalized["overrides"] = normalized_overrides
-
-  # Convert status enum string to integer
-  if "status" in normalized and isinstance(normalized["status"], str):
-    status_map = {"notDownloading": 0, "downloading": 1, "downloaded": 2, "cached": 3, "failed": 4}
-    normalized["status"] = status_map.get(normalized["status"], 0)
-
   return normalized
 
 
@@ -137,9 +114,7 @@ def _coerce_bundle(bundle: dict | custom.ModelManagerSP.ModelBundle | None) -> c
   bundle = _normalize_bundle_dict(bundle)
   try:
     return custom.ModelManagerSP.ModelBundle(**bundle)
-  except Exception as e:
-    from openpilot.common.swaglog import cloudlog
-    cloudlog.error(f"model_manager_helpers: failed to parse bundle: {e}")
+  except Exception:
     return None
 
 
