@@ -26,7 +26,7 @@ LON_MPC_STEP = 0.2  # first step is 0.2s
 A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
 # Ford/Lincoln comfort: limit positive accel to reduce kickdown / high RPM and encourage earlier upshifts.
 # Slightly higher in 0-30 km/h for better launch, while keeping mid/high speed conservative.
-A_CRUISE_MAX_VALS_FORD = [2.6, 1.95, 1.55, 1.05, 0.78, 0.55, 0.40, 0.28, 0.20, 0.012]
+A_CRUISE_MAX_VALS_FORD = [2.5, 2.1, 1.65, 1.20, 0.78, 0.64, 0.5, 0.40, 0.32, 0.25]
 A_CRUISE_MAX_BP = [0.,  3,   6.,  8.,  11., 15.,  20.,  25.,  30.,  55.]
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
