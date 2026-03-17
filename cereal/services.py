@@ -78,7 +78,6 @@ _services: dict[str, tuple] = {
   "rawAudioData": (False, 20.),
   "bookmarkButton": (True, 0., 1),
   "audioFeedback": (True, 0., 1),
-  "amapNavi": (True, 0.),
 
   # debug
   "uiDebug": (True, 0., 1),
