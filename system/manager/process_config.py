@@ -171,7 +171,7 @@ procs = [
     PythonProcess("joystick", "tools.joystick.joystick_control", and_(joystick, iscar)),
     PythonProcess("dashy", "dragonpilot.dashy.backend.server", dashy),
 
-    PythonProcess("amap_navi", "selfdrive.carrot.amap_navi", always_run),
+    #PythonProcess("amap_navi", "selfdrive.carrot.amap_navi", always_run),
 ]
 
 managed_processes = {p.name: p for p in procs}
