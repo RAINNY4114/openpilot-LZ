@@ -213,11 +213,40 @@ class Controls:
     # Check which actuators can be enabled
     standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, 0.3) or CS.standstill
     self.alka_active = self.alka_enabled and CS.cruiseState.available and not standstill and CS.gearShifter != car.CarState.GearShifter.reverse
-    lat_active = self.sm['selfdriveState'].active or self.alka_active
+    # ===== 自动车道居中（速度触发）=====
+    auto_lka = self.alka_enabled and CS.vEgo > 5 / 3.6
+    lat_active = self.sm['selfdriveState'].active or auto_lka
+
+    # 低速保护
+    if CS.vEgo < 5 / 3.6:
+      lat_active = False
+
+    # 方向盘接管
+    if abs(CS.steeringTorque) > 2.0:
+      lat_active = False
+
+    # 车道线检测（强烈建议）
+    model = self.sm['modelV2']
+    if min(model.laneLineProbs) < 0.3:
+      lat_active = False
+
+    # 延迟激活（更平顺）
+    if not hasattr(self, "lka_timer"):
+      self.lka_timer = 0
+
+    if auto_lka:
+      self.lka_timer += 1
+    else:
+      self.lka_timer = 0
+
+    lat_active = lat_active and self.lka_timer > 50
+
+    # 人类接管检测
     htd_allowed, self.htd_state = self.htd.update(lat_active, CS.steeringAngleDeg, CS.steeringTorque, CS.vEgo)
     lat_active = lat_active and htd_allowed
-    CC.latActive = lat_active and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
-                   (not standstill or self.CP.steerAtStandstill)
+
+    # 最终输出
+    CC.latActive = lat_active and not CS.steerFaultTemporary and not CS.steerFaultPermanent 
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
 
     actuators = CC.actuators
