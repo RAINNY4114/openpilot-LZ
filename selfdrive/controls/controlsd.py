@@ -212,7 +212,7 @@ class Controls:
 
     # Check which actuators can be enabled
     standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, 0.3) or CS.standstill
-    self.alka_active = self.alka_enabled and CS.cruiseState.available and not standstill and CS.gearShifter != car.CarState.GearShifter.reverse
+    self.alka_active = self.alka_enabled
     # ===== 自动车道居中（速度触发）=====
     auto_lka = self.alka_enabled and CS.vEgo > 5 / 3.6
     lat_active = self.sm['selfdriveState'].active or auto_lka
