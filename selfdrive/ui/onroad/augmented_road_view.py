@@ -51,12 +51,14 @@ ROAD_CAM_MIN_SPEED = 15.0  # m/s (34 mph)
 INF_POINT = np.array([1000.0, 0.0, 0.0])
 
 # dp
-DP_INDICATOR_BLINK_RATE_FAST = int(gui_app.target_fps * 0.25)
-DP_INDICATOR_BLINK_RATE_STD = int(gui_app.target_fps * 0.5)
-DP_INDICATOR_COLOR_BSM = rl.Color(255, 255, 0, 255)
-DP_INDICATOR_COLOR_BLINKER = rl.Color(0, 255, 0, 255)
+DP_INDICATOR_BLINKER_ONLY_HZ = 1.0
+DP_INDICATOR_BSM_ONLY_HZ = 3.3
+DP_INDICATOR_BSM_WITH_BLINKER_HZ = 5.0
 DP_INDICATOR_COLOR_BSM_ENHANCED = rl.Color(255, 0, 0, 255)
 DP_INDICATOR_COLOR_BLINKER_ENHANCED = rl.Color(255, 255, 0, 255)
+DP_BSD_ICON_TEXTURE_SIZE = 256
+DP_BSD_ICON_WIDTH = 256.0
+DP_BSD_ICON_HEIGHT = 256.0
 DP_DECEL_BAR_MIN_MS2 = 0.25
 DP_DECEL_BAR_MAX_MS2 = 3.0
 DP_HARD_BRAKE_DECEL_MS2 = 3.5
@@ -82,6 +84,7 @@ DET_SHOW_DISTANCE = bool(int(os.getenv("DP_DET_SHOW_DISTANCE", "0")))
 DET_DRAW_ALL = bool(int(os.getenv("DP_DET_DRAW_ALL", "0")))
 DET_VEHICLE_CLASS_IDS = {1, 2, 3, 5, 7}  # bicycle/car/moto/bus/truck
 DET_DRAW_CLASSES = {0, 80} | DET_VEHICLE_CLASS_IDS
+DET_FEATURE_PARAMS = ("dp_lat_cone_detection", "dp_lincoln_auto_avoid", "dp_lincoln_auto_overtake")
 
 # Adjacent-lane occupancy visualization (uses coned bboxes + model lane lines).
 # This is a conservative "block" cue for the driver, not a guarantee that a lane is clear.
@@ -226,6 +229,80 @@ def _lane_y_at_x(lane_x: np.ndarray, lane_y: np.ndarray, x_m: float) -> float | 
   return float(np.interp(float(x_m), lane_x, lane_y))
 
 
+def _det_features_enabled(params: Params) -> bool:
+  return any(params.get_bool(k) for k in DET_FEATURE_PARAMS)
+
+
+def _det_bbox_iou(a: dict, b: dict) -> float:
+  try:
+    ax1 = float(a.get("x1", 0.0))
+    ay1 = float(a.get("y1", 0.0))
+    ax2 = float(a.get("x2", 0.0))
+    ay2 = float(a.get("y2", 0.0))
+    bx1 = float(b.get("x1", 0.0))
+    by1 = float(b.get("y1", 0.0))
+    bx2 = float(b.get("x2", 0.0))
+    by2 = float(b.get("y2", 0.0))
+  except Exception:
+    return 0.0
+
+  ix1 = max(ax1, bx1)
+  iy1 = max(ay1, by1)
+  ix2 = min(ax2, bx2)
+  iy2 = min(ay2, by2)
+  iw = max(0.0, ix2 - ix1)
+  ih = max(0.0, iy2 - iy1)
+  inter = iw * ih
+  if inter <= 0.0:
+    return 0.0
+
+  area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+  area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+  union = area_a + area_b - inter
+  if union <= 0.0:
+    return 0.0
+  return float(inter / union)
+
+
+def _det_payload_objects(payload: dict | None, *, prefer_refined: bool) -> list[dict]:
+  if not isinstance(payload, dict):
+    return []
+
+  primary_key = "objsR" if prefer_refined else "objs"
+  fallback_key = "objs" if prefer_refined else "objsR"
+  src = payload.get(primary_key, None)
+  if not isinstance(src, list) or not src:
+    src = payload.get(fallback_key, []) or []
+
+  objs = [dict(o) for o in src if isinstance(o, dict)]
+
+  # `cones` is the dedicated low-threshold traffic-cone stream. Merge it into the object stream
+  # so HUD markers still render if the generic object list is empty or misses a cone.
+  cones = payload.get("cones", []) or []
+  if isinstance(cones, list):
+    for c in cones:
+      if not isinstance(c, dict):
+        continue
+      try:
+        cone_obj = {
+          "c": 80,
+          "x1": float(c.get("x1", 0.0)),
+          "y1": float(c.get("y1", 0.0)),
+          "x2": float(c.get("x2", 0.0)),
+          "y2": float(c.get("y2", 0.0)),
+          "s": float(c.get("s", 0.0)),
+        }
+      except Exception:
+        continue
+      if cone_obj["x2"] <= cone_obj["x1"] or cone_obj["y2"] <= cone_obj["y1"]:
+        continue
+      duplicate = any(isinstance(o, dict) and int(o.get("c", -1)) == 80 and _det_bbox_iou(o, cone_obj) >= 0.60 for o in objs)
+      if not duplicate:
+        objs.append(cone_obj)
+
+  return objs
+
+
 @dataclass
 class _DynamicFontCacheEntry:
   font: rl.Font
@@ -257,6 +334,10 @@ class AugmentedRoadView(CameraView):
     self._dp_indicator_count_right = 0
     self._dp_indicator_color_left = rl.Color(0, 0, 0, 0)
     self._dp_indicator_color_right = rl.Color(0, 0, 0, 0)
+    self._dp_indicator_started_at_left: float | None = None
+    self._dp_indicator_started_at_right: float | None = None
+    self._txt_bsd_left: rl.Texture = gui_app.texture("icons/bsd_l.png", DP_BSD_ICON_TEXTURE_SIZE, DP_BSD_ICON_TEXTURE_SIZE)
+    self._txt_bsd_right: rl.Texture = gui_app.texture("icons/bsd_r.png", DP_BSD_ICON_TEXTURE_SIZE, DP_BSD_ICON_TEXTURE_SIZE)
 
     # debug
     self._pm = messaging.PubMaster(['uiDebug'])
@@ -373,7 +454,7 @@ class AugmentedRoadView(CameraView):
     return rl.Rectangle(float(x_offset), float(y_offset), float(scale_x), float(scale_y))
 
   def _draw_object_detections(self, rect: rl.Rectangle) -> None:
-    if not self._params.get_bool("dp_lat_cone_detection"):
+    if not _det_features_enabled(self._params):
       return
     sm = ui_state.sm
     det_ts_sof_ns = 0
@@ -395,29 +476,7 @@ class AugmentedRoadView(CameraView):
             self._det_img_h = img_h
             self._det_tracker.reset()
 
-          objs = self._det_payload.get("objsR", []) or []
-          if not objs:
-            objs = self._det_payload.get("objs", []) or []
-
-          # Backward/robustness: if the refined/raw streams are empty but `cones` is present,
-          # surface cones in the HUD by promoting them into the object stream.
-          try:
-            have_cone = any(isinstance(o, dict) and int(o.get("c", -1)) == 80 for o in objs)
-            cones = self._det_payload.get("cones", []) or []
-            if (not have_cone) and isinstance(cones, list):
-              for c in cones:
-                if not isinstance(c, dict):
-                  continue
-                objs.append({
-                  "c": 80,
-                  "x1": float(c.get("x1", 0.0)),
-                  "y1": float(c.get("y1", 0.0)),
-                  "x2": float(c.get("x2", 0.0)),
-                  "y2": float(c.get("y2", 0.0)),
-                  "s": float(c.get("s", 0.0)),
-                })
-          except Exception:
-            pass
+          objs = _det_payload_objects(self._det_payload, prefer_refined=True)
           if not DET_DRAW_ALL:
             try:
               objs = [o for o in objs if isinstance(o, dict) and int(o.get("c", -1)) in DET_DRAW_CLASSES]
@@ -487,7 +546,8 @@ class AugmentedRoadView(CameraView):
               lane_right_x = lane_right_x[::-1]
               lane_right_y = lane_right_y[::-1]
 
-            lane_lines_ok = bool(lane_left_x.size >= 2 and lane_right_x.size >= 2 and lane_left_x.size == lane_left_y.size and lane_right_x.size == lane_right_y.size)
+            lane_lines_ok = bool(lane_left_x.size >= 2 and lane_right_x.size >= 2 and
+                                 lane_left_x.size == lane_left_y.size and lane_right_x.size == lane_right_y.size)
     except Exception:
       lane_lines_ok = False
 
@@ -496,7 +556,7 @@ class AugmentedRoadView(CameraView):
     # an occupied target lane close enough to block a lane change.
     try:
       if cs is not None and lane_lines_ok and focal_length_px_det > 1.0:
-        objs_raw = (self._det_payload.get("objsR", None) or self._det_payload.get("objs", [])) or []
+        objs_raw = _det_payload_objects(self._det_payload, prefer_refined=False)
         if isinstance(objs_raw, list):
           occ = compute_lane_occupancy(
             objs=objs_raw,
@@ -577,17 +637,17 @@ class AugmentedRoadView(CameraView):
 
         if dist_m is not None and lane_lines_ok:
           cx = 0.5 * (x1 + x2)
-          y_m = -((float(cx) - float(img_w) * 0.5) * float(dist_m) / max(float(focal_length_px_det), 1.0))
+          y_m = (float(cx) - float(img_w) * 0.5) * float(dist_m) / max(float(focal_length_px_det), 1.0)
           if np.isfinite(y_m):
             y_left = _lane_y_at_x(lane_left_x, lane_left_y, dist_m)
             y_right = _lane_y_at_x(lane_right_x, lane_right_y, dist_m)
             if y_left is not None and y_right is not None:
-              left_boundary = max(float(y_left), float(y_right))
-              right_boundary = min(float(y_left), float(y_right))
+              left_boundary = min(float(y_left), float(y_right))
+              right_boundary = max(float(y_left), float(y_right))
               margin = float(AUTO_LC_UI_LANE_MARGIN_M)
-              if y_m > (left_boundary + margin):
+              if y_m < (left_boundary - margin):
                 lane_dir = 1
-              elif y_m < (right_boundary - margin):
+              elif y_m > (right_boundary + margin):
                 lane_dir = -1
               else:
                 lane_dir = 0
@@ -782,46 +842,45 @@ class AugmentedRoadView(CameraView):
       border_color = BORDER_COLORS[UIStatus.ALKA]
     base_border_color = border_color
 
-    # Lincoln HUD enhancements: brake intensity colors the whole border (FrogPilot-style "whole frame" cue)
-    if ui_state.dp_lincoln_hud_enhanced:
-      sm = ui_state.sm
-      if sm.alive.get("carState", False):
-        cs = sm["carState"]
-        brake_pressed = bool(getattr(cs, "brakePressed", False))
+    # Brake intensity colors the whole border (FrogPilot-style "whole frame" cue)
+    sm = ui_state.sm
+    if sm.alive.get("carState", False):
+      cs = sm["carState"]
+      brake_pressed = bool(getattr(cs, "brakePressed", False))
 
-        # 1) Actual deceleration (covers stock ACC braking too)
-        a_ego = float(getattr(cs, "aEgo", 0.0))
-        decel = max(0.0, -a_ego)  # m/s^2
-        decel_intensity = float(np.interp(decel, [DP_DECEL_BAR_MIN_MS2, DP_DECEL_BAR_MAX_MS2], [0.0, 1.0]))
+      # 1) Actual deceleration (covers stock ACC braking too)
+      a_ego = float(getattr(cs, "aEgo", 0.0))
+      decel = max(0.0, -a_ego)  # m/s^2
+      decel_intensity = float(np.interp(decel, [DP_DECEL_BAR_MIN_MS2, DP_DECEL_BAR_MAX_MS2], [0.0, 1.0]))
 
-        # 2) Commanded brake (covers OP longitudinal brake actuation)
-        brake_cmd = 0.0
-        if sm.valid.get("carOutput", False):
-          brake_cmd = float(sm["carOutput"].actuatorsOutput.brake)
-        brake_intensity = float(np.interp(brake_cmd, [0.02, 0.6], [0.0, 1.0]))
+      # 2) Commanded brake (covers OP longitudinal brake actuation)
+      brake_cmd = 0.0
+      if sm.valid.get("carOutput", False):
+        brake_cmd = float(sm["carOutput"].actuatorsOutput.brake)
+      brake_intensity = float(np.interp(brake_cmd, [0.02, 0.6], [0.0, 1.0]))
 
-        intensity_raw = max(decel_intensity, brake_intensity)
-        if brake_pressed:
-          intensity_raw = max(intensity_raw, 0.20)
-        intensity = float(np.clip(self._hud_brake_filter.update(intensity_raw), 0.0, 1.0))
+      intensity_raw = max(decel_intensity, brake_intensity)
+      if brake_pressed:
+        intensity_raw = max(intensity_raw, 0.20)
+      intensity = float(np.clip(self._hud_brake_filter.update(intensity_raw), 0.0, 1.0))
 
-        if intensity > 0.02:
-          hard_brake_pred = False
-          if sm.alive.get("modelV2", False):
-            hard_brake_pred = bool(sm["modelV2"].meta.hardBrakePredicted)
+      if intensity > 0.02:
+        hard_brake_pred = False
+        if sm.alive.get("modelV2", False):
+          hard_brake_pred = bool(sm["modelV2"].meta.hardBrakePredicted)
 
-          hard_brake = hard_brake_pred or (decel >= DP_HARD_BRAKE_DECEL_MS2) or (brake_cmd >= DP_HARD_BRAKE_BRAKE_CMD)
-          if hard_brake:
-            flash_on = (time.monotonic() * DP_HARD_BRAKE_FLASH_HZ) % 1.0 < 0.5
-            border_color = rl.Color(255, 0, 0, 255) if flash_on else base_border_color
-          else:
-            t = intensity
-            border_color = rl.Color(
-              int(base_border_color.r + t * (255 - base_border_color.r)),
-              int(base_border_color.g + t * (0 - base_border_color.g)),
-              int(base_border_color.b + t * (0 - base_border_color.b)),
-              base_border_color.a,
-            )
+        hard_brake = hard_brake_pred or (decel >= DP_HARD_BRAKE_DECEL_MS2) or (brake_cmd >= DP_HARD_BRAKE_BRAKE_CMD)
+        if hard_brake:
+          flash_on = (time.monotonic() * DP_HARD_BRAKE_FLASH_HZ) % 1.0 < 0.5
+          border_color = rl.Color(255, 0, 0, 255) if flash_on else base_border_color
+        else:
+          t = intensity
+          border_color = rl.Color(
+            int(base_border_color.r + t * (255 - base_border_color.r)),
+            int(base_border_color.g + t * (0 - base_border_color.g)),
+            int(base_border_color.b + t * (0 - base_border_color.b)),
+            base_border_color.a,
+          )
 
     border_rect = rl.Rectangle(rect.x + UI_BORDER_SIZE, rect.y + UI_BORDER_SIZE,
                                rect.width - 2 * UI_BORDER_SIZE, rect.height - 2 * UI_BORDER_SIZE)
@@ -830,10 +889,57 @@ class AugmentedRoadView(CameraView):
     # dp - Side indicators
     indicator_y = int(rect.y+4*UI_BORDER_SIZE)
     indicator_height = int(rect.height-8*UI_BORDER_SIZE)
+    left_blindspot = False
+    right_blindspot = False
+    if sm.alive.get("carState", False):
+      left_blindspot = bool(getattr(sm["carState"], "leftBlindspot", False))
+      right_blindspot = bool(getattr(sm["carState"], "rightBlindspot", False))
+
     if self._dp_indicator_show_left:
       rl.draw_rectangle(int(rect.x), indicator_y, UI_BORDER_SIZE, indicator_height, self._dp_indicator_color_left)
+      if left_blindspot:
+        self._draw_dp_bsd_icon(rect, is_left=True)
     if self._dp_indicator_show_right:
       rl.draw_rectangle(int(rect.x + rect.width-UI_BORDER_SIZE), indicator_y, UI_BORDER_SIZE, indicator_height, self._dp_indicator_color_right)
+      if right_blindspot:
+        self._draw_dp_bsd_icon(rect, is_left=False)
+
+  def _draw_dp_bsd_icon(self, rect: rl.Rectangle, *, is_left: bool) -> None:
+    texture = self._txt_bsd_left if is_left else self._txt_bsd_right
+    if getattr(texture, "id", 0) == 0:
+      return
+
+    icon_w = DP_BSD_ICON_WIDTH
+    icon_h = DP_BSD_ICON_HEIGHT
+    inset_x = float(UI_BORDER_SIZE) + 8.0
+    # These icons have a very small opaque region inside a 256x256 canvas.
+    # Crop to a side-aligned 128x128 region so the visible car/waves render larger
+    # without changing the established inner-edge placement.
+    crop_x = 0.0 if is_left else 128.0
+    crop_y = 0.0
+    crop_w = 128.0
+    crop_h = 128.0
+
+    visible_x = 1.0 if is_left else 184.0 - crop_x
+    visible_y = 17.0 - crop_y
+    visible_w = 71.0
+    visible_h = 73.0
+    scale_x = icon_w / crop_w
+    scale_y = icon_h / crop_h
+
+    if is_left:
+      visible_left = float(rect.x + inset_x)
+      icon_x = visible_left - visible_x * scale_x
+    else:
+      visible_right = float(rect.x + rect.width - inset_x)
+      icon_x = visible_right - (visible_x + visible_w) * scale_x
+
+    visible_center_y = float(rect.y + rect.height * 0.5)
+    icon_y = visible_center_y - (visible_y + visible_h * 0.5) * scale_y
+
+    src_rect = rl.Rectangle(crop_x, crop_y, crop_w, crop_h)
+    dst_rect = rl.Rectangle(icon_x, icon_y, icon_w, icon_h)
+    rl.draw_texture_pro(texture, src_rect, dst_rect, rl.Vector2(0, 0), 0.0, rl.WHITE)
 
   def _switch_stream_if_needed(self, sm):
     if sm['selfdriveState'].experimentalMode and WIDE_CAM in self.available_streams:
@@ -933,54 +1039,51 @@ class AugmentedRoadView(CameraView):
 
     return self._cached_matrix
 
-  def _update_dp_indicator_side_state(self, blinker_state, bsm_state, show_prev, count_prev):
-    if not blinker_state and not bsm_state:
-      return False, 0, rl.Color(0, 0, 0, 0)
+  @staticmethod
+  def _indicator_phase_show(elapsed_s: float, hz: float) -> bool:
+    if hz <= 0.0:
+      return True
 
+    half_period_s = 0.5 / hz
+    if half_period_s <= 0.0:
+      return True
+
+    return int(elapsed_s / half_period_s) % 2 == 0
+
+  def _update_dp_indicator_side_state(self, blinker_state, bsm_state, show_prev, count_prev, started_at_prev):
+    if not blinker_state and not bsm_state:
+      return False, 0, rl.Color(0, 0, 0, 0), None
+
+    now = time.monotonic()
+    started_at = now if started_at_prev is None else started_at_prev
+    elapsed_s = max(0.0, now - started_at)
     count = count_prev + 1
     show = True
     color = rl.Color(0, 0, 0, 0)
 
-    if ui_state.dp_lincoln_hud_enhanced:
-      # Enhanced logic: blinker = yellow flash, blindspot = red flash, both = red fast flash
-      if bsm_state:
-        blink_rate = DP_INDICATOR_BLINK_RATE_FAST if blinker_state else DP_INDICATOR_BLINK_RATE_STD
-        show = (count // blink_rate) % 2 == 0
-        color = DP_INDICATOR_COLOR_BSM_ENHANCED
-      elif blinker_state:
-        blink_rate = DP_INDICATOR_BLINK_RATE_STD
-        show = (count // blink_rate) % 2 == 0
-        color = DP_INDICATOR_COLOR_BLINKER_ENHANCED
-      else:
-        show = False
+    # blinker = yellow flash, blindspot = red flash, both = red fast flash
+    if bsm_state:
+      hz = DP_INDICATOR_BSM_WITH_BLINKER_HZ if blinker_state else DP_INDICATOR_BSM_ONLY_HZ
+      show = self._indicator_phase_show(elapsed_s, hz)
+      color = DP_INDICATOR_COLOR_BSM_ENHANCED
+    elif blinker_state:
+      show = self._indicator_phase_show(elapsed_s, DP_INDICATOR_BLINKER_ONLY_HZ)
+      color = DP_INDICATOR_COLOR_BLINKER_ENHANCED
     else:
-      if bsm_state and blinker_state:
-        show = (count // DP_INDICATOR_BLINK_RATE_FAST) % 2 == 0
-        color = DP_INDICATOR_COLOR_BSM
-      elif blinker_state:
-        show = (count // DP_INDICATOR_BLINK_RATE_STD) % 2 == 0
-        color = DP_INDICATOR_COLOR_BLINKER
-      elif bsm_state:
-        show = True
-        color = DP_INDICATOR_COLOR_BSM
-      else:
-        show = False
+      show = False
 
-    return show, count, color
+    return show, count, color, started_at
 
   def _update_dp_indicator_states(self, sm):
     cs = sm['carState']
-    self._dp_indicator_show_left, self._dp_indicator_count_left, self._dp_indicator_color_left = \
+    self._dp_indicator_show_left, self._dp_indicator_count_left, self._dp_indicator_color_left, self._dp_indicator_started_at_left = \
       self._update_dp_indicator_side_state(cs.leftBlinker, cs.leftBlindspot,
-                                           self._dp_indicator_show_left, self._dp_indicator_count_left)
-    self._dp_indicator_show_right, self._dp_indicator_count_right, self._dp_indicator_color_right = \
+                                           self._dp_indicator_show_left, self._dp_indicator_count_left, self._dp_indicator_started_at_left)
+    self._dp_indicator_show_right, self._dp_indicator_count_right, self._dp_indicator_color_right, self._dp_indicator_started_at_right = \
       self._update_dp_indicator_side_state(cs.rightBlinker, cs.rightBlindspot,
-                                           self._dp_indicator_show_right, self._dp_indicator_count_right)
+                                           self._dp_indicator_show_right, self._dp_indicator_count_right, self._dp_indicator_started_at_right)
 
   def _draw_hud_enhancements(self) -> None:
-    if not ui_state.dp_lincoln_hud_enhanced:
-      return
-
     sm = ui_state.sm
     if not sm.alive.get("carState", False):
       return
@@ -993,11 +1096,11 @@ class AugmentedRoadView(CameraView):
 
     # FrogPilot-style blindspot "wall" (drawn in the adjacent lane polygon)
     if cs.leftBlindspot:
-      drew = self._draw_hud_fp_blindspot_wall(rect=rect, is_left=True)
+      self._draw_hud_fp_blindspot_wall(rect=rect, is_left=True)
       # Removed: internal trapezoid blinker band
 
     if cs.rightBlindspot:
-      drew = self._draw_hud_fp_blindspot_wall(rect=rect, is_left=False)
+      self._draw_hud_fp_blindspot_wall(rect=rect, is_left=False)
       # Removed: internal trapezoid blinker band
 
   @staticmethod
@@ -1186,14 +1289,10 @@ class AugmentedRoadView(CameraView):
     draw_polygon(rect, np.array(points, dtype=np.float32), gradient=gradient)
 
   def _draw_performance_info(self) -> None:
-    if not ui_state.dp_lincoln_perf_info_enabled:
-      return
-
     rect = self._content_rect
     if rect.width <= 0 or rect.height <= 0:
       return
 
-    sm = ui_state.sm
     stats = self._get_perf_stats()
     curvature_text, steering_text, torque_text = self._get_curvature_steer_torque()
     direction_text = self._get_direction_label()
