@@ -1,0 +1,16 @@
+def is_running_on_wsl2():
+  try:
+    with open('/proc/version', 'r') as f:
+      contents = f.read()
+      return 'WSL2' in contents or 'microsoft' in contents.lower()
+  except FileNotFoundError:
+    return False
+
+SConscript(['pandad/SConscript'])
+SConscript(['controls/lib/lateral_mpc_lib/SConscript'])
+SConscript(['controls/lib/longitudinal_mpc_lib/SConscript'])
+SConscript(['locationd/SConscript'])
+SConscript(['modeld/SConscript'])
+SConscript(['ui/SConscript'])
+if not is_running_on_wsl2():
+  SConscript(['navd/SConscript'])
