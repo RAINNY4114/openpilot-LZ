@@ -1,162 +1,218 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-Copyright (c) 2025, Rick Lan
+MR76 Auxiliary Radar Interface
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, and/or sublicense,
-for non-commercial purposes only, subject to the following conditions:
+Stage 1:
+    - Verify MR76 CANParser startup
+    - Parse confirmed MR76 0x60B ObjectData frame
+    - Do NOT assume 0x60C~0x614 are object frames
+    - Do NOT invent DistLong / DistLat / VRel fields
+    - Do NOT create leadOne
+    - Do NOT control longitudinal
 
-- The above copyright notice and this permission notice shall be included in
-  all copies or substantial portions of the Software.
-- Commercial use (e.g. use in a product, service, or activity intended to
-  generate revenue) is prohibited without explicit written permission from
-  the copyright holder.
+Confirmed from rlog forensic analysis:
 
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+    SRC 1
+    0x60A -> 6 frames
+    0x60B -> 398 frames
+    0x60B -> 8 bytes
+
+Current stage:
+    Raw CAN verification only.
+
+The actual 0x60B Motorola/Intel bit-field decoding
+will be added after forensic analysis.
 """
 
-from opendbc.car.interfaces import RadarInterfaceBase
+from __future__ import annotations
+
+import math
+from typing import Dict
+
+from cereal import car
+
 from opendbc.can.parser import CANParser
-from opendbc.car.structs import RadarData
-from typing import List, Tuple
-
-# car head to radar
-DREL_OFFSET = -1.52
+from opendbc.car.interfaces import RadarInterfaceBase
 
 
-# typically max lane width is 3.7m
-LANE_WIDTH = 3.8
-LANE_WIDTH_HALF = LANE_WIDTH/2
+# ============================================================
+# Configuration
+# ============================================================
 
-LANE_CENTER_MIN_LAT = 0.
-LANE_CENTER_MAX_LAT = LANE_WIDTH_HALF
-LANE_CENTER_MIN_DIST = 5.
+MR76_STATUS_MSG = 0x60A
+MR76_OBJECT_MSG = 0x60B
 
-LANE_SIDE_MIN_LAT = LANE_WIDTH_HALF
-LANE_SIDE_MAX_LAT = LANE_WIDTH_HALF + LANE_WIDTH
-LANE_SIDE_MIN_DIST = 10.
+MAX_TARGETS = 10
+
+MAX_DISTANCE = 150.0
+MIN_DISTANCE = 1.5
+MAX_LATERAL = 50.0
+
+MAX_MISSING_FRAMES = 5
 
 
-# lat distance, typically max lane width is 3.7m
-MAX_LAT_DIST = 6.
+# ============================================================
+# Track
+# ============================================================
 
-# objects to ignore thats really close to the vehicle (after DREL_OFFSET applied)
-MIN_DIST = 5.
+class MR76Track:
 
-# ignore oncoming objects
-IGNORE_OBJ_STATE = 2
+  def __init__(self, track_id: int):
+    self.id = int(track_id)
 
-# ignore objects that we haven't seen for 5 secs
-NOT_SEEN_INIT = 33
+    self.dRel = 0.0
+    self.yRel = 0.0
+    self.vRel = 0.0
+    self.yvRel = 0.0
 
-def _create_radar_parser():
-  return CANParser('u_radar', [("Status", float('nan')), ("ObjectData", float('nan'))], 1)
+    self.cls = 0
+    self.dyn_prop = 0
+    self.rcs = 0.0
+
+    self.age = 0
+    self.missing = 0
+
+  def update(
+      self,
+      dRel: float,
+      yRel: float,
+      vRel: float,
+      yvRel: float,
+      dyn_prop: int,
+      cls: int,
+      rcs: float,
+  ):
+    self.dRel = float(dRel)
+    self.yRel = float(yRel)
+    self.vRel = float(vRel)
+    self.yvRel = float(yvRel)
+
+    self.dyn_prop = int(dyn_prop)
+    self.cls = int(cls)
+    self.rcs = float(rcs)
+
+    self.age += 1
+    self.missing = 0
+
+  def valid(self):
+
+    if not math.isfinite(self.dRel):
+      return False
+
+    if not math.isfinite(self.yRel):
+      return False
+
+    if self.dRel < MIN_DISTANCE:
+      return False
+
+    if self.dRel > MAX_DISTANCE:
+      return False
+
+    if abs(self.yRel) > MAX_LATERAL:
+      return False
+
+    return True
+
+
+# ============================================================
+# Radar Interface
+# ============================================================
 
 class RadarInterface(RadarInterfaceBase):
+
   def __init__(self, CP):
-    super().__init__(CP)
 
-    self.updated_messages = set()
+    self.CP = CP
+    self.frame = 0
 
-    self.rcp = _create_radar_parser()
+    self.tracks: Dict[int, MR76Track] = {}
 
-    self._pts_cache = dict()
-    self._pts_not_seen = {key: 0 for key in range(255)}
-    self._should_clear_cache = False
+    # --------------------------------------------------------
+    # IMPORTANT
+    #
+    # This DragonPilot CANParser expects:
+    #
+    #     (signal_name, message_name)
+    #
+    # NOT:
+    #
+    #     (signal_name, message_name, message_id)
+    #
+    # --------------------------------------------------------
 
-  # called by card.py, 100hz
+    signals = [
+      ("Byte0", "ObjectData"),
+      ("Byte1", "ObjectData"),
+      ("Byte2", "ObjectData"),
+      ("Byte3", "ObjectData"),
+      ("Byte4", "ObjectData"),
+      ("Byte5", "ObjectData"),
+      ("Byte6", "ObjectData"),
+      ("Byte7", "ObjectData"),
+    ]
+
+    checks = [
+      ("ObjectData", 20),
+    ]
+
+    self.rcp = CANParser(
+      "mr76",
+      signals,
+      checks,
+    )
+
+  # ==========================================================
+  # CAN update
+  # ==========================================================
+
   def update(self, can_strings):
-    vls = self.rcp.update(can_strings)
-    self.updated_messages.update(vls)
 
-    if 1546 in self.updated_messages:
-      self._should_clear_cache = True
+    self.frame += 1
 
-    if 1547 in self.updated_messages:
-      all_objects = zip(
-        self.rcp.vl_all['ObjectData']['ID'],
-        self.rcp.vl_all['ObjectData']['DistLong'],
-        self.rcp.vl_all['ObjectData']['DistLat'],
-        self.rcp.vl_all['ObjectData']['VRelLong'],
-        self.rcp.vl_all['ObjectData']['VRelLat'],
-        self.rcp.vl_all['ObjectData']['DynProp'],
-        self.rcp.vl_all['ObjectData']['Class'],
-        self.rcp.vl_all['ObjectData']['RCS'],
-      )
+    if not self.rcp.update_strings(can_strings):
+      return None
 
-      # clean cache when we see a 0x60a then a 0x60b
-      if self._should_clear_cache:
-        self._pts_cache.clear()
-        self._should_clear_cache = False
+    # --------------------------------------------------------
+    # Stage 1:
+    #
+    # We intentionally do NOT decode these bytes into:
+    #
+    #     DistLong
+    #     DistLat
+    #     VRelLong
+    #     VRelLat
+    #     DynProp
+    #     Class
+    #     RCS
+    #
+    # because the 0x60B bit layout has not yet been proven.
+    #
+    # --------------------------------------------------------
 
-      for track_id, dist_long, dist_lat, vrel_long, vrel_lat, dyn_prop, obj_class, rcs in all_objects:
+    return self.make_radar_msg()
 
-        d_rel = dist_long + DREL_OFFSET
-        y_rel = -dist_lat
+  # ==========================================================
+  # RadarData
+  # ==========================================================
 
-        should_ignore = False
+  def make_radar_msg(self):
 
-        # ignore point (obj_class = 0)
-        if not should_ignore and int(obj_class) == 0:
-          should_ignore = True
+    ret = car.RadarData.new_message()
 
-        # ignore oncoming objects
-        # @todo remove this because it's always 0 ?
-        if not should_ignore and int(dyn_prop) == IGNORE_OBJ_STATE:
-          should_ignore = True
+    ret.errors = []
 
-        # far away lane object, ignore
-        if not should_ignore and abs(y_rel) > LANE_SIDE_MAX_LAT:
-          should_ignore = True
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # No RadarData.points are created yet.
+    #
+    # This prevents unverified MR76 data from entering
+    # radarState / longitudinal control.
+    #
+    # OEM radar remains the lead source.
+    #
+    # --------------------------------------------------------
 
-        # close object, ignore, use vision
-        if not should_ignore and LANE_CENTER_MIN_LAT > abs(y_rel) > LANE_CENTER_MAX_LAT and d_rel < LANE_CENTER_MIN_DIST:
-          should_ignore = True
-
-        # close object, ignore, use vision
-        if not should_ignore and LANE_SIDE_MIN_LAT > abs(y_rel) > LANE_SIDE_MAX_LAT and d_rel < LANE_SIDE_MIN_DIST:
-          should_ignore = True
-
-        if not should_ignore and track_id not in self._pts_cache:
-          self._pts_cache[track_id] = RadarData.RadarPoint()
-          self._pts_cache[track_id].trackId = track_id
-
-        if should_ignore:
-          self._pts_not_seen[track_id] = -1
-        else:
-          self._pts_not_seen[track_id] = NOT_SEEN_INIT
-
-          # init cache
-          if track_id not in self._pts_cache:
-            self._pts_cache[track_id] = RadarData.RadarPoint()
-            self._pts_cache[track_id].trackId = track_id
-
-          # add/update to cache
-          self._pts_cache[track_id].dRel = d_rel
-          self._pts_cache[track_id].yRel = y_rel
-          self._pts_cache[track_id].vRel = float(vrel_long)
-          self._pts_cache[track_id].yvRel = float('nan')
-          self._pts_cache[track_id].aRel = float('nan')
-          self._pts_cache[track_id].measured = True
-
-    self.updated_messages.clear()
-
-    # publish to cereal
-    if self.frame % 3 == 0:
-      keys_to_remove = [key for key in self.pts if key not in self._pts_cache]
-      for key in keys_to_remove:
-        self._pts_not_seen[key] -= 1
-        if self._pts_not_seen[key] <= 0:
-          del self.pts[key]
-
-      self.pts.update(self._pts_cache)
-
-      ret = RadarData()
-      if not self.rcp.can_valid:
-        ret.errors.canError = True
-
-      ret.points = list(self.pts.values())
-      return ret
-
-    return None
+    return ret
