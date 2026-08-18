@@ -158,7 +158,7 @@ class RadarInterface(RadarInterfaceBase):
     ]
 
     self.rcp = CANParser(
-      "mr76",
+      "u_radar",
       signals,
       checks,
     )
