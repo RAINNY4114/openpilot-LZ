@@ -666,7 +666,6 @@ class MR76Radar:
           float(
             self._get_signal(
               values,
-              "TargetClass",
               "Class",
               default=0.0
             )
