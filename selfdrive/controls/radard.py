@@ -671,7 +671,6 @@ class MR76Radar:
             )
           )
         )
-      )
 
       rcs = float(
         self._get_signal(
