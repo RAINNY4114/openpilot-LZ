@@ -847,32 +847,12 @@ class RadarInterface(RadarInterfaceBase):
   def make_radar_msg(
     self,
   ):
-
     ret = car.RadarData.new_message()
 
-    # ------------------------------------------------------------------------
-    # No errors are generated from MR76 auxiliary processing.
-    #
-    # An auxiliary radar failure must not disable OEM radar/control.
-    # ------------------------------------------------------------------------
-
-    ret.errors = []
-
-    # ------------------------------------------------------------------------
-    # CRITICAL:
-    #
-    # DO NOT create:
-    #
-    #     ret.points
-    #
-    # DO NOT create:
-    #
-    #     leadOne
-    #
-    # DO NOT inject MR76 into the longitudinal planner.
-    #
-    # OEM radar remains the control radar.
-    # ------------------------------------------------------------------------
+    ret.errors.canError = False
+    ret.errors.radarFault = False
+    ret.errors.wrongConfig = False
+    ret.errors.radarUnavailableTemporary = False
 
     return ret
 
