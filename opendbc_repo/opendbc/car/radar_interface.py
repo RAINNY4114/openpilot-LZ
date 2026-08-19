@@ -849,6 +849,11 @@ class RadarInterface(RadarInterfaceBase):
   ):
     ret = car.RadarData.new_message()
 
+    # MR76 is auxiliary radar.
+    # Do not inject MR76 targets into RadarData.points.
+    # Keep empty list for capnp compatibility.
+    ret.points = []
+
     ret.errors.canError = False
     ret.errors.radarFault = False
     ret.errors.wrongConfig = False
