@@ -1198,7 +1198,7 @@ class Car:
 
       object_count = min(
         len(objects),
-        255,
+        20,
       )
 
       state_msg.objectCount = (
