@@ -1,85 +1,734 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+MR76 Auxiliary Radar parser
+===========================
+
+Smartmicro MR76 auxiliary radar.
+
+CAN messages:
+
+    0x201  RadarState
+    0x60A  Status
+    0x60B  ObjectData
+
+DBC:
+
+    u_radar.dbc
+
+DBC location:
+
+    opendbc_repo/opendbc/dbc/u_radar.dbc
+
+Architecture:
+
+    pandad
+       |
+       v
+    card.py
+       |
+       +---- CI.update()
+       |
+       +---- RI.update()
+       |
+       +---- MR76Radar.update()
+                         |
+                         v
+                    MR76 targets
+                         |
+                         v
+                     mr76State
+
+IMPORTANT
+---------
+
+This module:
+
+    - DOES parse MR76 CAN frames
+    - DOES cache MR76 state
+    - DOES NOT subscribe to CAN
+    - DOES NOT publish cereal directly
+    - DOES NOT modify the original RadarInterface
+    - DOES NOT modify liveTracks
+    - DOES NOT modify RadarDataT
+    - DOES NOT send CAN
+    - DOES NOT affect vehicle control
+
+The caller (card.py) is responsible for publishing mr76State.
+
+This design intentionally keeps MR76 completely outside the
+original OpenPilot control/radar chain.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+
+from dataclasses import dataclass
+from typing import Any
+
+from opendbc.can.parser import CANParser
+from openpilot.selfdrive.pandad import can_capnp_to_list
 
 
-VERSION ""
+# =============================================================================
+# Configuration
+# =============================================================================
+
+MR76_RADAR_STATE_ID = 0x201
+MR76_STATUS_ID = 0x60A
+MR76_OBJECT_ID = 0x60B
+
+MR76_MESSAGE_IDS = (
+  MR76_RADAR_STATE_ID,
+  MR76_STATUS_ID,
+  MR76_OBJECT_ID,
+)
+
+MR76_DBC = "u_radar"
+
+# Current OpenPilot CAN parser supports:
+#
+#     CANParser(dbc_name, messages, bus)
+#
+# Do NOT use the old:
+#
+#     CANParser(dbc_name, signals, checks, bus)
+#
+MR76_BUS = 0
+
+MAX_OBJECTS = 255
+
+OBJECT_TIMEOUT_S = 0.50
+STATUS_TIMEOUT_S = 1.00
+RADAR_STATE_TIMEOUT_S = 1.00
 
 
-NS_ :
-	NS_DESC_
-	CM_
-	BA_DEF_
-	BA_
-	VAL_
-	CAT_DEF_
-	CAT_
-	FILTER
-	BA_DEF_DEF_
-	EV_DATA_
-	ENVVAR_DATA_
-	SGTYPE_
-	SGTYPE_VAL_
-	BA_DEF_SGTYPE_
-	BA_SGTYPE_
-	SIG_TYPE_REF_
-	VAL_TABLE_
-	SIG_GROUP_
-	SIG_VALTYPE_
-	SIGTYPE_VALTYPE_
-	BO_TX_BU_
-	BA_DEF_REL_
-	BA_REL_
-	BA_DEF_DEF_REL_
-	BU_SG_REL_
-	BU_EV_REL_
-	BU_BO_REL_
-	SG_MUL_VAL_
+# =============================================================================
+# Utility
+# =============================================================================
 
-BS_:
+def _safe_float(value: Any, default: float = 0.0) -> float:
+  try:
+    v = float(value)
+    return v if math.isfinite(v) else default
+  except Exception:
+    return default
 
-BU_: RADAR
 
-BO_ 513 RadarState: 8 XXX
- SG_ NVMReadStatus : 6|1@0+ (1,0) [0|1] "" XXX
- SG_ NVMWriteStatus : 7|1@0+ (1,0) [0|1] "" XXX
- SG_ MaxDistanceCfg : 15|10@0+ (2,0) [0|2046] "m" XXX
- SG_ RadarPowerCfg : 25|3@0+ (1,0) [0|7] "" XXX
- SG_ SensorID : 34|3@0+ (1,0) [0|7] "" XXX
- SG_ SortIndex : 38|3@0+ (1,0) [0|7] "" XXX
- SG_ CtrlRelayCfg : 41|1@0+ (1,0) [0|1] "" XXX
- SG_ OutputTypeCfg : 43|2@0+ (1,0) [0|3] "" XXX
- SG_ QualityInfoCfg : 44|1@0+ (1,0) [0|1] "" XXX
- SG_ ExtInfoCfg : 45|1@0+ (1,0) [0|1] "" XXX
- SG_ CANBaudRate : 55|3@0+ (1,0) [0|7] "" XXX
- SG_ InterfaceType : 57|2@0+ (1,0) [0|3] "" XXX
- SG_ RCSThreshold : 58|3@1+ (1,0) [0|7] "" XXX
- SG_ CalibrationEnabled : 63|2@0+ (1,0) [0|3] "" XXX
+def _safe_int(value: Any, default: int = 0) -> int:
+  try:
+    return int(value)
+  except Exception:
+    return default
 
-VAL_ 513 NVMReadStatus 0 "Failed" 1 "Successful";
-VAL_ 513 NVMWriteStatus 0 "Failed" 1 "Successful";
-VAL_ 513 RadarPowerCfg 0 "Standard" 1 "-3dB Gain" 2 "-6dB Gain" 3 "-9dB Gain";
-VAL_ 513 SortIndex 0 "No Sorting" 1 "Sort By Range" 2 "Sort By RCS";
-VAL_ 513 CtrlRelayCfg 0 "Off" 1 "On";
-VAL_ 513 OutputTypeCfg 0 "None" 1 "Objects" 2 "Clusters";
-VAL_ 513 QualityInfoCfg 0 "Off" 1 "On";
-VAL_ 513 ExtInfoCfg 0 "Off" 1 "On";
-VAL_ 513 CANBaudRate 0 "500K" 1 "250K" 2 "1M";
-VAL_ 513 RCSThreshold 0 "Standard" 1 "High Sensitivity";
-VAL_ 513 CalibrationEnabled 1 "Enabled" 2 "Initial Recovery";
 
-BO_ 1546 Status: 8 RADAR
- SG_ NoOfObjects : 7|8@0+ (1,0) [0|255] "" XXX
- SG_ MeasCount : 15|16@0+ (1,0) [0|65535] "" XXX
- SG_ InterfaceVersion : 31|4@0+ (1,0) [0|15] "" XXX
+def _finite(value: Any) -> bool:
+  try:
+    return math.isfinite(float(value))
+  except Exception:
+    return False
 
-BO_ 1547 ObjectData: 8 RADAR
- SG_ ID : 7|8@0+ (1,0) [0|255] "" XXX
- SG_ DistLong : 15|13@0+ (0.2,-500) [-500|1138.2] "m" XXX
- SG_ DistLat : 18|11@0+ (0.2,-204.6) [-204.6|204.8] "m" XXX
- SG_ VRelLong : 39|10@0+ (0.25,-128) [-128|127.75] "m/s" XXX
- SG_ VRelLat : 45|9@0+ (0.25,-64) [-64|63.75] "m/s" XXX
- SG_ DynProp : 50|3@0+ (1,0) [0|7] "" XXX
- SG_ Class : 52|2@0+ (1,0) [0|3] "" XXX
- SG_ RCS : 63|8@0+ (0.5,-64) [-64|63.75] "dBm2" XXX
 
-CM_ BO_ 1547 "Object detection and tracking information";
-VAL_ 1547 DynProp 0 "moving" 1 "stationary" 2 "oncoming" 3 "crossing_left" 4 "crossing_right" 5 "unknown" 6 "stopped";
-VAL_ 1547 Class 0 "point" 1 "vehicle";
+def _clamp(
+  value: float,
+  minimum: float,
+  maximum: float,
+) -> float:
+  return max(minimum, min(maximum, value))
+
+
+def _get_signal(
+  signals: Any,
+  name: str,
+  default: Any = 0,
+) -> Any:
+  """
+  Safely read a signal from CANParser.vl.
+
+  Supports:
+
+      dict
+
+      parser.vl[message][signal]
+
+  The function is intentionally defensive because different
+  OpenPilot/opendbc versions can expose slightly different
+  dictionary wrappers.
+  """
+
+  if signals is None:
+    return default
+
+  try:
+    if isinstance(signals, dict):
+      return signals.get(name, default)
+  except Exception:
+    pass
+
+  try:
+    return getattr(signals, name)
+  except Exception:
+    return default
+
+
+# =============================================================================
+# Target
+# =============================================================================
+
+@dataclass
+class MR76Target:
+  """
+  One MR76 tracked target.
+  """
+
+  target_id: int = 0
+
+  dist_long: float = 0.0
+  dist_lat: float = 0.0
+
+  vrel_long: float = 0.0
+  vrel_lat: float = 0.0
+
+  dyn_prop: int = 5
+  target_class: int = 0
+
+  rcs: float = 0.0
+
+  last_update: float = 0.0
+  frame_count: int = 0
+
+  @property
+  def distance(self) -> float:
+    return math.hypot(
+      self.dist_long,
+      self.dist_lat,
+    )
+
+  @property
+  def is_vehicle(self) -> bool:
+    return self.target_class == 1
+
+  @property
+  def is_moving(self) -> bool:
+    return self.dyn_prop == 0
+
+  @property
+  def is_stationary(self) -> bool:
+    return self.dyn_prop in (1, 6)
+
+  @property
+  def is_oncoming(self) -> bool:
+    return self.dyn_prop == 2
+
+  @property
+  def is_crossing(self) -> bool:
+    return self.dyn_prop in (3, 4)
+
+
+# =============================================================================
+# MR76 Radar
+# =============================================================================
+
+class MR76Radar:
+  """
+  MR76 CAN parser.
+
+  This class is deliberately independent from RadarInterfaceBase.
+
+  Input:
+
+      list[CanData]
+
+  Output:
+
+      internal MR76 state
+
+  card.py can then convert this state into cereal Custom.MR76State.
+  """
+
+  def __init__(
+    self,
+    dbc_name: str = MR76_DBC,
+    bus: int = MR76_BUS,
+  ):
+    self.dbc_name = dbc_name
+    self.bus = bus
+
+    self.parser = CANParser(
+      self.dbc_name,
+      [
+        (MR76_RADAR_STATE_ID, 10),
+        (MR76_STATUS_ID, 10),
+        (MR76_OBJECT_ID, 50),
+      ],
+      self.bus,
+    )
+
+    self.targets: dict[int, MR76Target] = {}
+
+    self.radar_state = {}
+    self.status = {}
+
+    self.last_radar_state = 0.0
+    self.last_status = 0.0
+    self.last_object = 0.0
+
+    self.update_count = 0
+    self.object_frame_count = 0
+
+    self.last_update_mono_time_ns = 0
+
+    self.can_error_count = 0
+
+  # ---------------------------------------------------------------------------
+  # CAN update
+  # ---------------------------------------------------------------------------
+
+  def update(
+    self,
+    can_strings: list[Any],
+    now: float | None = None,
+  ) -> None:
+    """
+    Feed CAN packets into the MR76 parser.
+
+    This function never sends CAN and never publishes cereal.
+    """
+
+    if now is None:
+      now = time.monotonic()
+
+    if not can_strings:
+      self._expire_objects(now)
+      return
+
+    try:
+      self.parser.update_strings(can_strings)
+    except Exception:
+      self.can_error_count += 1
+      return
+
+    self.update_count += 1
+    self.last_update_mono_time_ns = time.monotonic_ns()
+
+    self._update_radar_state(now)
+    self._update_status(now)
+    self._update_objects(now)
+
+    self._expire_objects(now)
+
+  # ---------------------------------------------------------------------------
+  # RadarState
+  # ---------------------------------------------------------------------------
+
+  def _update_radar_state(self, now: float) -> None:
+    try:
+      vl = self.parser.vl[MR76_RADAR_STATE_ID]
+    except Exception:
+      try:
+        vl = self.parser.vl["RadarState"]
+      except Exception:
+        return
+
+    if not vl:
+      return
+
+    self.radar_state = dict(vl)
+    self.last_radar_state = now
+
+  # ---------------------------------------------------------------------------
+  # Status
+  # ---------------------------------------------------------------------------
+
+  def _update_status(self, now: float) -> None:
+    try:
+      vl = self.parser.vl[MR76_STATUS_ID]
+    except Exception:
+      try:
+        vl = self.parser.vl["Status"]
+      except Exception:
+        return
+
+    if not vl:
+      return
+
+    self.status = dict(vl)
+    self.last_status = now
+
+  # ---------------------------------------------------------------------------
+  # ObjectData
+  # ---------------------------------------------------------------------------
+
+  def _update_objects(self, now: float) -> None:
+    try:
+      vl = self.parser.vl[MR76_OBJECT_ID]
+    except Exception:
+      try:
+        vl = self.parser.vl["ObjectData"]
+      except Exception:
+        return
+
+    if not vl:
+      return
+
+    # A CAN parser dictionary can contain values initialized to zero
+    # before the first real frame. We therefore use the ID field only
+    # as an object identifier and rely on the frame timestamps / parser
+    # update flow for freshness.
+    target_id = _safe_int(
+      _get_signal(vl, "ID", 0),
+      0,
+    )
+
+    if target_id < 0 or target_id > 255:
+      return
+
+    dist_long = _safe_float(
+      _get_signal(vl, "DistLong", 0.0),
+    )
+
+    dist_lat = _safe_float(
+      _get_signal(vl, "DistLat", 0.0),
+    )
+
+    vrel_long = _safe_float(
+      _get_signal(vl, "VRelLong", 0.0),
+    )
+
+    vrel_lat = _safe_float(
+      _get_signal(vl, "VRelLat", 0.0),
+    )
+
+    dyn_prop = _safe_int(
+      _get_signal(vl, "DynProp", 5),
+      5,
+    )
+
+    target_class = _safe_int(
+      _get_signal(vl, "Class", 0),
+      0,
+    )
+
+    rcs = _safe_float(
+      _get_signal(vl, "RCS", 0.0),
+    )
+
+    # Sanity limits from the DBC.
+    dist_long = _clamp(
+      dist_long,
+      -500.0,
+      1138.2,
+    )
+
+    dist_lat = _clamp(
+      dist_lat,
+      -204.6,
+      204.8,
+    )
+
+    vrel_long = _clamp(
+      vrel_long,
+      -128.0,
+      127.75,
+    )
+
+    vrel_lat = _clamp(
+      vrel_lat,
+      -64.0,
+      63.75,
+    )
+
+    rcs = _clamp(
+      rcs,
+      -64.0,
+      63.75,
+    )
+
+    target = self.targets.get(target_id)
+
+    if target is None:
+      target = MR76Target(
+        target_id=target_id,
+      )
+      self.targets[target_id] = target
+
+    target.dist_long = dist_long
+    target.dist_lat = dist_lat
+
+    target.vrel_long = vrel_long
+    target.vrel_lat = vrel_lat
+
+    target.dyn_prop = dyn_prop
+    target.target_class = target_class
+
+    target.rcs = rcs
+
+    target.last_update = now
+    target.frame_count += 1
+
+    self.object_frame_count += 1
+
+  # ---------------------------------------------------------------------------
+  # Expiration
+  # ---------------------------------------------------------------------------
+
+  def _expire_objects(self, now: float) -> None:
+    expired = [
+      target_id
+      for target_id, target in self.targets.items()
+      if now - target.last_update > OBJECT_TIMEOUT_S
+    ]
+
+    for target_id in expired:
+      self.targets.pop(target_id, None)
+
+  # ---------------------------------------------------------------------------
+  # Validity
+  # ---------------------------------------------------------------------------
+
+  def radar_state_valid(self, now: float | None = None) -> bool:
+    if now is None:
+      now = time.monotonic()
+
+    return (
+      self.last_radar_state > 0.0
+      and now - self.last_radar_state <= RADAR_STATE_TIMEOUT_S
+    )
+
+  def status_valid(self, now: float | None = None) -> bool:
+    if now is None:
+      now = time.monotonic()
+
+    return (
+      self.last_status > 0.0
+      and now - self.last_status <= STATUS_TIMEOUT_S
+    )
+
+  def object_data_valid(self, now: float | None = None) -> bool:
+    if now is None:
+      now = time.monotonic()
+
+    return (
+      self.last_object > 0.0
+      and now - self.last_object <= OBJECT_TIMEOUT_S
+    )
+
+  @property
+  def object_count(self) -> int:
+    return len(self.targets)
+
+  # ---------------------------------------------------------------------------
+  # RadarState properties
+  # ---------------------------------------------------------------------------
+
+  def get_radar_state(self, name: str, default: Any = 0) -> Any:
+    return _get_signal(
+      self.radar_state,
+      name,
+      default,
+    )
+
+  def get_status(self, name: str, default: Any = 0) -> Any:
+    return _get_signal(
+      self.status,
+      name,
+      default,
+    )
+
+  # ---------------------------------------------------------------------------
+  # Snapshot
+  # ---------------------------------------------------------------------------
+
+  def snapshot(
+    self,
+    now: float | None = None,
+  ) -> dict[str, Any]:
+    """
+    Return a plain Python snapshot.
+
+    Useful for diagnostics and cereal publishing.
+    """
+
+    if now is None:
+      now = time.monotonic()
+
+    radar_valid = self.radar_state_valid(now)
+    status_valid = self.status_valid(now)
+
+    object_valid = (
+      self.object_count > 0
+      and any(
+        now - t.last_update <= OBJECT_TIMEOUT_S
+        for t in self.targets.values()
+      )
+    )
+
+    objects = []
+
+    for target in sorted(
+      self.targets.values(),
+      key=lambda x: (
+        x.distance,
+        x.target_id,
+      ),
+    ):
+      objects.append({
+        "id": target.target_id,
+
+        "distLong": target.dist_long,
+        "distLat": target.dist_lat,
+
+        "vRelLong": target.vrel_long,
+        "vRelLat": target.vrel_lat,
+
+        "dynProp": target.dyn_prop,
+        "targetClass": target.target_class,
+
+        "rcs": target.rcs,
+        "distance": target.distance,
+
+        "lastUpdateMonoTime": int(
+          target.last_update * 1e9
+        ),
+      })
+
+    return {
+      "valid": radar_valid or status_valid or object_valid,
+
+      "radarStateValid": radar_valid,
+      "statusValid": status_valid,
+      "objectDataValid": object_valid,
+
+      "nvmReadStatus": _safe_int(
+        self.get_radar_state("NVMReadStatus", 0)
+      ),
+
+      "nvmWriteStatus": _safe_int(
+        self.get_radar_state("NVMWriteStatus", 0)
+      ),
+
+      "maxDistance": _safe_float(
+        self.get_radar_state("MaxDistanceCfg", 0.0)
+      ),
+
+      "radarPower": _safe_int(
+        self.get_radar_state("RadarPowerCfg", 0)
+      ),
+
+      "sensorId": _safe_int(
+        self.get_radar_state("SensorID", 0)
+      ),
+
+      "sortIndex": _safe_int(
+        self.get_radar_state("SortIndex", 0)
+      ),
+
+      "outputType": _safe_int(
+        self.get_radar_state("OutputTypeCfg", 0)
+      ),
+
+      "qualityInfo": bool(
+        _safe_int(
+          self.get_radar_state("QualityInfoCfg", 0)
+        )
+      ),
+
+      "extInfo": bool(
+        _safe_int(
+          self.get_radar_state("ExtInfoCfg", 0)
+        )
+      ),
+
+      "canBaudRate": _safe_int(
+        self.get_radar_state("CANBaudRate", 0)
+      ),
+
+      "interfaceType": _safe_int(
+        self.get_radar_state("InterfaceType", 0)
+      ),
+
+      "rcsThreshold": _safe_int(
+        self.get_radar_state("RCSThreshold", 0)
+      ),
+
+      "calibrationEnabled": _safe_int(
+        self.get_radar_state("CalibrationEnabled", 0)
+      ),
+
+      "numObjects": _safe_int(
+        self.get_status("NoOfObjects", 0)
+      ),
+
+      "measCount": _safe_int(
+        self.get_status("MeasCount", 0)
+      ),
+
+      "interfaceVersion": _safe_int(
+        self.get_status("InterfaceVersion", 0)
+      ),
+
+      "objectCount": len(objects),
+
+      "objects": objects,
+
+      "lastUpdateMonoTime": self.last_update_mono_time_ns,
+    }
+
+
+# =============================================================================
+# Standalone diagnostic
+# =============================================================================
+
+def main() -> None:
+  print("=" * 80)
+  print("MR76 Auxiliary Radar parser")
+  print("=" * 80)
+
+  print(f"DBC        : {MR76_DBC}")
+  print(f"Bus        : {MR76_BUS}")
+  print(f"RadarState : 0x{MR76_RADAR_STATE_ID:X}")
+  print(f"Status     : 0x{MR76_STATUS_ID:X}")
+  print(f"ObjectData : 0x{MR76_OBJECT_ID:X}")
+
+  print()
+  print("Creating CANParser...")
+
+  try:
+    radar = MR76Radar()
+  except Exception as e:
+    print()
+    print("ERROR: CANParser initialization failed")
+    print(
+      f"{type(e).__name__}: {e}"
+    )
+    return
+
+  print("CANParser: OK")
+
+  print()
+  print("DBC:", radar.parser.dbc_name)
+  print("BUS:", radar.parser.bus)
+
+  print(
+    "Addresses:",
+    [
+      hex(x)
+      for x in sorted(radar.parser.addresses)
+    ],
+  )
+
+  print()
+  print("VL keys:")
+  print(list(radar.parser.vl.keys()))
+
+  print()
+  print("=" * 80)
+  print("MR76 CANPARSER TEST PASSED")
+  print("=" * 80)
+
+
+if __name__ == "__main__":
+  main()
