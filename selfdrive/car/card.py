@@ -8,18 +8,42 @@ import cereal.messaging as messaging
 from cereal import car, log
 
 from openpilot.common.params import Params
-from openpilot.common.realtime import config_realtime_process, Priority, Ratekeeper
-from openpilot.common.swaglog import cloudlog, ForwardingHandler
+from openpilot.common.realtime import (
+  config_realtime_process,
+  Priority,
+  Ratekeeper,
+)
+from openpilot.common.swaglog import (
+  cloudlog,
+  ForwardingHandler,
+)
 
 from opendbc.car import DT_CTRL, structs
-from opendbc.car.can_definitions import CanData, CanRecvCallable, CanSendCallable
+from opendbc.car.can_definitions import (
+  CanData,
+  CanRecvCallable,
+  CanSendCallable,
+)
 from opendbc.car.carlog import carlog
 from opendbc.car.fw_versions import ObdCallback
-from opendbc.car.car_helpers import get_car, interfaces
-from opendbc.car.interfaces import CarInterfaceBase, RadarInterfaceBase
-from openpilot.selfdrive.pandad import can_capnp_to_list, can_list_to_can_capnp
-from openpilot.selfdrive.car.cruise import VCruiseHelper
-from openpilot.selfdrive.car.car_specific import MockCarState
+from opendbc.car.car_helpers import (
+  get_car,
+  interfaces,
+)
+from opendbc.car.interfaces import (
+  CarInterfaceBase,
+  RadarInterfaceBase,
+)
+from openpilot.selfdrive.pandad import (
+  can_capnp_to_list,
+  can_list_to_can_capnp,
+)
+from openpilot.selfdrive.car.cruise import (
+  VCruiseHelper,
+)
+from openpilot.selfdrive.car.car_specific import (
+  MockCarState,
+)
 from opendbc.safety import ALTERNATIVE_EXPERIENCE
 
 
@@ -32,7 +56,9 @@ EventName = log.OnroadEvent.EventName
 # MR76 auxiliary radar
 # =============================================================================
 #
-# MR76 is completely isolated from the original OpenPilot radar/control path.
+# MR76 is an AUXILIARY / TELEMETRY radar path.
+#
+# It is deliberately isolated from the normal OpenPilot radar/control path.
 #
 # CAN:
 #
@@ -46,48 +72,92 @@ EventName = log.OnroadEvent.EventName
 #
 # Output:
 #
-#   Event.mr76State
+#   mr76State
 #
 # IMPORTANT:
 #
-#   MR76 does NOT:
+# MR76 does NOT:
 #
-#     - modify RadarDataT
-#     - modify liveTracks
-#     - replace self.RI
-#     - modify CarState
-#     - modify CarControl
-#     - send CAN
-#     - affect controls
+#   - modify RadarDataT
+#   - modify liveTracks
+#   - replace self.RI
+#   - modify CarState
+#   - modify CarControl
+#   - send CAN
+#   - participate in controls
 #
-# The only connection is:
+# CPU SAFETY:
 #
-#     CAN -> u_radar -> snapshot() -> mr76State
+#   card main loop       = 100 Hz
+#   MR76 parser          = 20 Hz
+#   mr76State publisher  = 20 Hz
+#
+# The normal vehicle control path remains 100 Hz.
 #
 # =============================================================================
 
 
 MR76_ENABLED = True
 
+# -----------------------------------------------------------------------------
+# MR76 CPU limits
+# -----------------------------------------------------------------------------
+#
+# Do NOT run MR76 at the card's 100 Hz rate.
+#
+# 20 Hz is sufficient for auxiliary radar telemetry and substantially reduces
+# the amount of work performed by CANParser and cereal publication.
+#
+# -----------------------------------------------------------------------------
+
+MR76_UPDATE_HZ = 20.0
+MR76_UPDATE_PERIOD = 1.0 / MR76_UPDATE_HZ
+
+MR76_PUBLISH_HZ = 20.0
+MR76_PUBLISH_PERIOD = 1.0 / MR76_PUBLISH_HZ
+
+# -----------------------------------------------------------------------------
+# Only these three CAN IDs belong to MR76.
+# -----------------------------------------------------------------------------
+
+MR76_RADAR_STATE_ID = 0x201
+MR76_STATUS_ID = 0x60A
+MR76_OBJECT_ID = 0x60B
+
+MR76_CAN_IDS = {
+  MR76_RADAR_STATE_ID,
+  MR76_STATUS_ID,
+  MR76_OBJECT_ID,
+}
+
+MR76_BUS = 1
+
 
 def _load_mr76():
   """
-  Load the MR76 parser lazily.
+  Load MR76 lazily.
 
-  MR76 failure must never prevent the normal card process from
-  starting or running.
+  Any MR76 import failure must never prevent card from starting.
   """
+
   if not MR76_ENABLED:
     return None
 
   try:
-    from openpilot.selfdrive.mr76.u_radar import MR76Radar
+
+    from openpilot.selfdrive.mr76.u_radar import (
+      MR76Radar,
+    )
+
     return MR76Radar
 
   except Exception:
+
     cloudlog.exception(
-      "MR76: failed to import openpilot.selfdrive.mr76.u_radar"
+      "MR76: failed to import "
+      "openpilot.selfdrive.mr76.u_radar"
     )
+
     return None
 
 
@@ -107,19 +177,24 @@ carlog.addHandler(
 # OBD callback
 # =============================================================================
 
-def obd_callback(params: Params) -> ObdCallback:
+def obd_callback(
+  params: Params,
+) -> ObdCallback:
 
   def set_obd_multiplexing(
     obd_multiplexing: bool,
   ):
+
     if (
       params.get_bool(
         "ObdMultiplexingEnabled"
       )
       != obd_multiplexing
     ):
+
       cloudlog.warning(
-        f"Setting OBD multiplexing to {obd_multiplexing}"
+        f"Setting OBD multiplexing to "
+        f"{obd_multiplexing}"
       )
 
       params.remove(
@@ -158,12 +233,6 @@ def can_comm_callbacks(
   def can_recv(
     wait_for_one: bool = False,
   ) -> list[list[CanData]]:
-    """
-    Receive CAN packets from logcan.
-
-    Returns:
-      list[list[CanData]]
-    """
 
     ret = []
 
@@ -227,7 +296,7 @@ class Car:
     )
 
     # -------------------------------------------------------------------------
-    # subscriptions
+    # Subscriptions
     # -------------------------------------------------------------------------
 
     self.sm = messaging.SubMaster([
@@ -237,7 +306,7 @@ class Car:
     ])
 
     # -------------------------------------------------------------------------
-    # publications
+    # Publications
     # -------------------------------------------------------------------------
 
     self.pm = messaging.PubMaster([
@@ -247,12 +316,12 @@ class Car:
       "carOutput",
       "liveTracks",
 
-      # MR76 auxiliary radar
+      # MR76 auxiliary telemetry only
       "mr76State",
     ])
 
     # -------------------------------------------------------------------------
-    # normal card state
+    # Normal card state
     # -------------------------------------------------------------------------
 
     self.can_rcv_cum_timeout_counter = 0
@@ -292,6 +361,27 @@ class Car:
 
     self.mr76_publish_count = 0
 
+    # -------------------------------------------------------------------------
+    # MR76 scheduling
+    #
+    # The main card loop remains 100 Hz.
+    # MR76 itself is deliberately limited to 20 Hz.
+    # -------------------------------------------------------------------------
+
+    now = time.monotonic()
+
+    self.mr76_next_update = now
+
+    self.mr76_next_publish = now
+
+    # -------------------------------------------------------------------------
+    # Diagnostics counters
+    # -------------------------------------------------------------------------
+
+    self.mr76_filtered_frame_count = 0
+
+    self.mr76_filtered_batches = 0
+
     if (
       MR76_ENABLED
       and MR76Radar is not None
@@ -301,31 +391,31 @@ class Car:
 
         self.mr76 = MR76Radar(
           dbc_name="u_radar",
-          bus=0,
+          bus=MR76_BUS,
         )
 
         self.mr76_enabled = True
 
         cloudlog.info(
           "MR76: auxiliary radar parser initialized "
-          "(DBC=u_radar, bus=0)"
+          "(DBC=u_radar, bus=0, update=20Hz, publish=20Hz)"
         )
 
       except TypeError:
 
-        # Compatibility with positional constructor
+        # Compatibility with positional constructor.
         try:
 
           self.mr76 = MR76Radar(
             "u_radar",
-            0,
+            MR76_BUS,
           )
 
           self.mr76_enabled = True
 
           cloudlog.info(
             "MR76: auxiliary radar parser initialized "
-            "(positional args)"
+            "(positional args, update=20Hz, publish=20Hz)"
           )
 
         except Exception:
@@ -407,6 +497,7 @@ class Car:
       if self.params.get_bool(
         "dp_lat_alka"
       ):
+
         dp_params |= (
           structs.DPFlags.LateralALKA
         )
@@ -414,6 +505,7 @@ class Car:
       if self.params.get_bool(
         "dp_toyota_door_auto_lock_unlock"
       ):
+
         dp_params |= (
           structs.DPFlags.ToyotaLockCtrl
         )
@@ -421,6 +513,7 @@ class Car:
       if self.params.get_bool(
         "dp_toyota_tss1_sng"
       ):
+
         dp_params |= (
           structs.DPFlags.ToyotaTSS1SnG
         )
@@ -428,6 +521,7 @@ class Car:
       if self.params.get_bool(
         "dp_toyota_stock_lon"
       ):
+
         dp_params |= (
           structs.DPFlags.ToyotaStockLon
         )
@@ -435,6 +529,7 @@ class Car:
       if self.params.get_bool(
         "dp_vag_a0_sng"
       ):
+
         dp_params |= (
           structs.DPFlags.VagA0SnG
         )
@@ -442,6 +537,7 @@ class Car:
       if self.params.get_bool(
         "dp_vag_pq_steering_patch"
       ):
+
         dp_params |= (
           structs.DPFlags.VAGPQSteeringPatch
         )
@@ -449,6 +545,7 @@ class Car:
       if self.params.get_bool(
         "dp_vag_avoid_eps_lockout"
       ):
+
         dp_params |= (
           structs.DPFlags.VagAvoidEPSLockout
         )
@@ -675,11 +772,85 @@ class Car:
     # =========================================================================
     # Ratekeeper
     # =========================================================================
+    #
+    # NORMAL CARD LOOP = 100 Hz
+    #
+    # This must remain 100 Hz.
+    # MR76 is independently throttled to 20 Hz.
+    #
+    # =========================================================================
 
     self.rk = Ratekeeper(
       100,
       print_delay_threshold=None,
     )
+
+  # ===========================================================================
+  # MR76 CAN filtering
+  # ===========================================================================
+
+  @staticmethod
+  def _filter_mr76_can(
+    can_list,
+  ):
+    """
+    Extract only the three MR76 CAN messages.
+
+    This is intentionally lightweight.
+
+    MR76 receives:
+
+      0x201 RadarState
+      0x60A Status
+      0x60B ObjectData
+
+    Everything else is discarded before reaching MR76 CANParser.
+
+    The normal CI / RI path continues to receive the COMPLETE can_list.
+
+    Therefore this function cannot affect normal vehicle operation.
+    """
+
+    if not can_list:
+      return []
+
+    filtered = []
+
+    for frame in can_list:
+
+      try:
+
+        address = int(
+          getattr(
+            frame,
+            "address",
+            -1,
+          )
+        )
+
+        src = int(
+          getattr(
+            frame,
+            "src",
+            0,
+          )
+        )
+
+        if (
+          src == MR76_BUS
+          and address in MR76_CAN_IDS
+        ):
+
+          filtered.append(
+            frame
+          )
+
+      except Exception:
+
+        # Never allow malformed MR76 diagnostic data to affect card.
+        continue
+
+    return filtered
 
   # ===========================================================================
   # MR76 CAN update
@@ -690,40 +861,72 @@ class Car:
     can_list,
   ) -> None:
     """
-    Feed the already decoded CAN list into MR76.
+    Feed MR76 only when its 20 Hz scheduler allows it.
 
     IMPORTANT:
 
-      card.py already performs:
+      CI.update() and RI.update() still run at 100 Hz.
 
-        can_strs
-          |
-          v
-        can_capnp_to_list()
-          |
-          v
-        can_list
+      MR76 does not run on the critical 100 Hz control workload.
 
-      Therefore MR76 receives exactly the same CAN representation
-      that CI.update() and RI.update() receive.
-
-    MR76 is completely isolated from the original radar/control chain.
     """
 
     if (
       not self.mr76_enabled
       or self.mr76 is None
     ):
+
       return
+
+    now = time.monotonic()
+
+    # -------------------------------------------------------------------------
+    # 20 Hz throttle
+    # -------------------------------------------------------------------------
+
+    if now < self.mr76_next_update:
+
+      return
+
+    # -------------------------------------------------------------------------
+    # Schedule from current time instead of allowing accumulated lag.
+    #
+    # This prevents MR76 processing from "catching up" with multiple expensive
+    # iterations after a temporary CPU spike.
+    # -------------------------------------------------------------------------
+
+    self.mr76_next_update = (
+      now + MR76_UPDATE_PERIOD
+    )
 
     try:
 
       # -----------------------------------------------------------------------
-      # Current u_radar.py API
+      # Only pass MR76 CAN frames.
       #
-      #     MR76Radar.update(can_strings)
+      # The complete CAN list remains untouched for CI / RI.
+      # -----------------------------------------------------------------------
+
+      mr76_can = (
+        self._filter_mr76_can(
+          can_list
+        )
+      )
+
+      if not mr76_can:
+
+        return
+
+      self.mr76_filtered_batches += 1
+
+      self.mr76_filtered_frame_count += (
+        len(mr76_can)
+      )
+
+      # -----------------------------------------------------------------------
+      # Current u_radar.py API:
       #
-      # This is the API used by the supplied u_radar.py.
+      #     MR76Radar.update(can_list)
       # -----------------------------------------------------------------------
 
       update_method = getattr(
@@ -735,7 +938,7 @@ class Car:
       if callable(update_method):
 
         update_method(
-          can_list
+          mr76_can
         )
 
         self.mr76_update_count += 1
@@ -743,10 +946,7 @@ class Car:
         return
 
       # -----------------------------------------------------------------------
-      # Optional compatibility API.
-      #
-      # Only used if another MR76 implementation exposes
-      # update_strings().
+      # Compatibility API.
       # -----------------------------------------------------------------------
 
       update_strings = getattr(
@@ -758,7 +958,7 @@ class Car:
       if callable(update_strings):
 
         update_strings(
-          can_list
+          mr76_can
         )
 
         self.mr76_update_count += 1
@@ -766,10 +966,8 @@ class Car:
         return
 
       # -----------------------------------------------------------------------
-      # No supported API
+      # Unsupported parser API.
       # -----------------------------------------------------------------------
-
-      now = time.monotonic()
 
       if (
         now
@@ -788,7 +986,7 @@ class Car:
 
       now = time.monotonic()
 
-      # Do not spam card log at 100 Hz.
+      # Never spam card log.
       if (
         now
         - self.mr76_last_error_log
@@ -805,32 +1003,20 @@ class Car:
   # MR76 state acquisition
   # ===========================================================================
 
-  def _mr76_get_state(self):
-    """
-    Get a snapshot from u_radar.py.
-
-    Current MR76 implementation exposes:
-
-      radar.snapshot()
-
-    Compatibility is retained for:
-
-      get_state()
-      state
-    """
+  def _mr76_get_state(
+    self,
+  ):
 
     if (
       not self.mr76_enabled
       or self.mr76 is None
     ):
+
       return None
 
     try:
 
-      # -----------------------------------------------------------------------
-      # Current u_radar.py
-      # -----------------------------------------------------------------------
-
+      # Current u_radar API.
       snapshot = getattr(
         self.mr76,
         "snapshot",
@@ -841,10 +1027,7 @@ class Car:
 
         return snapshot()
 
-      # -----------------------------------------------------------------------
-      # Compatibility implementation
-      # -----------------------------------------------------------------------
-
+      # Compatibility.
       get_state = getattr(
         self.mr76,
         "get_state",
@@ -855,10 +1038,7 @@ class Car:
 
         return get_state()
 
-      # -----------------------------------------------------------------------
-      # Compatibility property
-      # -----------------------------------------------------------------------
-
+      # Compatibility property.
       if hasattr(
         self.mr76,
         "state",
@@ -895,10 +1075,7 @@ class Car:
     default=None,
   ):
     """
-    Read a value from either:
-
-      dict
-      dataclass/object
+    Read a value from dict/dataclass/object.
     """
 
     if obj is None:
@@ -914,7 +1091,6 @@ class Car:
         ):
 
           if name in obj:
-
             return obj[name]
 
         if hasattr(
@@ -940,24 +1116,28 @@ class Car:
     self,
   ) -> None:
     """
-    Publish MR76 telemetry.
+    Publish MR76 telemetry at 20 Hz maximum.
 
-    This function does NOT modify:
-
-      RadarDataT
-      liveTracks
-      CarState
-      CarControl
-
-    It does NOT send CAN.
+    This function does not touch any normal OpenPilot vehicle state.
     """
 
     if not self.mr76_enabled:
 
-      # MR76 module unavailable.
-      #
-      # We deliberately do not publish fake valid data.
       return
+
+    now = time.monotonic()
+
+    # -------------------------------------------------------------------------
+    # 20 Hz publication limit.
+    # -------------------------------------------------------------------------
+
+    if now < self.mr76_next_publish:
+
+      return
+
+    self.mr76_next_publish = (
+      now + MR76_PUBLISH_PERIOD
+    )
 
     try:
 
@@ -969,9 +1149,9 @@ class Car:
 
       state = self._mr76_get_state()
 
-      # =======================================================================
-      # No state
-      # =======================================================================
+      # -----------------------------------------------------------------------
+      # No state.
+      # -----------------------------------------------------------------------
 
       if state is None:
 
@@ -984,11 +1164,13 @@ class Car:
           msg,
         )
 
+        self.mr76_publish_count += 1
+
         return
 
-      # =======================================================================
-      # Top-level validity
-      # =======================================================================
+      # -----------------------------------------------------------------------
+      # Top-level validity.
+      # -----------------------------------------------------------------------
 
       state_msg.valid = bool(
         self._mr76_value(
@@ -1025,9 +1207,9 @@ class Car:
         )
       )
 
-      # =======================================================================
+      # -----------------------------------------------------------------------
       # RadarState
-      # =======================================================================
+      # -----------------------------------------------------------------------
 
       state_msg.nvmReadStatus = int(
         self._mr76_value(
@@ -1052,6 +1234,8 @@ class Car:
           state,
           "maxDistance",
           "max_distance",
+          "maxDistanceCfg",
+          "max_distance_cfg",
           default=0.0,
         )
       )
@@ -1061,6 +1245,8 @@ class Car:
           state,
           "radarPower",
           "radar_power",
+          "radarPowerCfg",
+          "radar_power_cfg",
           default=0,
         )
       )
@@ -1088,6 +1274,8 @@ class Car:
           state,
           "outputType",
           "output_type",
+          "outputTypeCfg",
+          "output_type_cfg",
           default=0,
         )
       )
@@ -1097,6 +1285,8 @@ class Car:
           state,
           "qualityInfo",
           "quality_info",
+          "qualityInfoCfg",
+          "quality_info_cfg",
           default=False,
         )
       )
@@ -1106,6 +1296,8 @@ class Car:
           state,
           "extInfo",
           "ext_info",
+          "extInfoCfg",
+          "ext_info_cfg",
           default=False,
         )
       )
@@ -1146,15 +1338,17 @@ class Car:
         )
       )
 
-      # =======================================================================
+      # -----------------------------------------------------------------------
       # Status
-      # =======================================================================
+      # -----------------------------------------------------------------------
 
       state_msg.numObjects = int(
         self._mr76_value(
           state,
           "numObjects",
           "num_objects",
+          "noOfObjects",
+          "no_of_objects",
           default=0,
         )
       )
@@ -1177,9 +1371,9 @@ class Car:
         )
       )
 
-      # =======================================================================
+      # -----------------------------------------------------------------------
       # Objects
-      # =======================================================================
+      # -----------------------------------------------------------------------
 
       objects = self._mr76_value(
         state,
@@ -1196,6 +1390,13 @@ class Car:
       except Exception:
         objects = []
 
+      # -----------------------------------------------------------------------
+      # Limit cereal payload.
+      #
+      # MR76 parser can retain up to 64 targets, but mr76State does not need
+      # to publish all of them every 50 ms.
+      # -----------------------------------------------------------------------
+
       object_count = min(
         len(objects),
         20,
@@ -1205,18 +1406,10 @@ class Car:
         object_count
       )
 
-      # -----------------------------------------------------------------------
-      # cereal list initialization
-      # -----------------------------------------------------------------------
-
       target_builders = state_msg.init(
         "objects",
         object_count,
       )
-
-      # -----------------------------------------------------------------------
-      # Targets
-      # -----------------------------------------------------------------------
 
       for i, target in enumerate(
         objects[:object_count]
@@ -1305,7 +1498,7 @@ class Car:
         )
 
         # ---------------------------------------------------------------------
-        # Distance
+        # Distance.
         # ---------------------------------------------------------------------
 
         distance = self._mr76_value(
@@ -1320,7 +1513,8 @@ class Car:
 
             distance = (
               float(out.distLong) ** 2
-              + float(out.distLat) ** 2
+              +
+              float(out.distLat) ** 2
             ) ** 0.5
 
           except Exception:
@@ -1332,14 +1526,7 @@ class Car:
         )
 
         # ---------------------------------------------------------------------
-        # Timestamp
-        #
-        # u_radar.snapshot() returns:
-        #
-        #   lastUpdateMonoTime
-        #
-        # for each target.
-        #
+        # Target timestamp.
         # ---------------------------------------------------------------------
 
         out.lastUpdateMonoTime = int(
@@ -1351,9 +1538,9 @@ class Car:
           )
         )
 
-      # =======================================================================
-      # Overall timestamp
-      # =======================================================================
+      # -----------------------------------------------------------------------
+      # Overall timestamp.
+      # -----------------------------------------------------------------------
 
       last_update = self._mr76_value(
         state,
@@ -1382,9 +1569,9 @@ class Car:
         last_update
       )
 
-      # =======================================================================
-      # Publish
-      # =======================================================================
+      # -----------------------------------------------------------------------
+      # Publish.
+      # -----------------------------------------------------------------------
 
       msg.valid = bool(
         state_msg.valid
@@ -1414,7 +1601,7 @@ class Car:
         self.mr76_last_error_log = now
 
   # ===========================================================================
-  # State update
+  # Main CAN-driven state update
   # ===========================================================================
 
   def state_update(
@@ -1423,28 +1610,9 @@ class Car:
     car.CarState,
     structs.RadarDataT | None,
   ]:
-    """
-    Main CAN-driven state update.
-
-    Order:
-
-      CAN
-       |
-       +--> can_list
-       |
-       +--> CI.update()
-       |
-       +--> RI.update()
-       |
-       +--> MR76.update()
-       |
-       +--> MR76.snapshot()/mr76State
-
-    MR76 never enters RI/RadarDataT.
-    """
 
     # -------------------------------------------------------------------------
-    # Receive raw CAN
+    # Receive raw CAN.
     # -------------------------------------------------------------------------
 
     can_strs = (
@@ -1455,7 +1623,9 @@ class Car:
     )
 
     # -------------------------------------------------------------------------
-    # Convert CAN exactly once
+    # Convert CAN exactly once.
+    #
+    # This complete can_list is still used by CI and RI.
     # -------------------------------------------------------------------------
 
     can_list = (
@@ -1465,7 +1635,7 @@ class Car:
     )
 
     # =========================================================================
-    # Original OpenPilot CAN -> CarState
+    # ORIGINAL OPENPILOT PATH
     # =========================================================================
 
     CS = self.CI.update(
@@ -1479,7 +1649,11 @@ class Car:
       )
 
     # =========================================================================
-    # Original OpenPilot radar
+    # ORIGINAL RADAR PATH
+    # =========================================================================
+    #
+    # MR76 does not replace this.
+    #
     # =========================================================================
 
     RD: structs.RadarDataT | None = (
@@ -1489,18 +1663,25 @@ class Car:
     )
 
     # =========================================================================
-    # MR76 auxiliary radar
+    # MR76 AUXILIARY PATH
+    # =========================================================================
     #
     # IMPORTANT:
     #
-    # MR76 gets the same can_list but has no connection to RD.
+    # This call is internally throttled to 20 Hz.
+    #
+    # The complete can_list is never modified.
+    #
     # =========================================================================
 
     self.update_mr76(
       can_list
     )
 
-    # Publish isolated telemetry.
+    # -------------------------------------------------------------------------
+    # mr76State publication is also internally throttled to 20 Hz.
+    # -------------------------------------------------------------------------
+
     self.publish_mr76_state()
 
     # =========================================================================
@@ -1804,7 +1985,9 @@ class Car:
   # Card thread
   # ===========================================================================
 
-  def card_thread(self):
+  def card_thread(
+    self,
+  ):
 
     e = threading.Event()
 
@@ -1836,8 +2019,16 @@ class Car:
 
 def main():
 
+  # ===========================================================================
+  # C3X CPU / realtime process
+  #
+  # REQUIRED:
+  #
+  #   process/core = 4
+  #
+  # ===========================================================================
   config_realtime_process(
-    3,
+    4,
     Priority.CTRL_HIGH,
   )
 
