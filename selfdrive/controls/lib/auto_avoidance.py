@@ -723,6 +723,7 @@ class SceneUnderstanding:
       except Exception:
         continue
 
+    self.mr76_object_count = len(objects)
     return objects
 
   # ========================================================================
