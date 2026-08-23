@@ -680,6 +680,7 @@ class SceneUnderstanding:
     try:
       raw_objects = list(raw_objects)
     except Exception:
+      self.mr76_object_count = 0
       return objects
 
     for raw in raw_objects:
