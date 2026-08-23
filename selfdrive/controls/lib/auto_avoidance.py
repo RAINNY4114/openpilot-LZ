@@ -161,7 +161,10 @@ class SceneUnderstanding:
   def __init__(self):
     self.camera_objects = []
     self.radar_objects = []
+
+    # MR76 independent multi-object cache.
     self.mr76_objects = []
+    self.mr76_object_count = 0
 
     self.objects = []
 
