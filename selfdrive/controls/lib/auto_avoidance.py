@@ -674,6 +674,7 @@ class SceneUnderstanding:
     raw_objects = self._find_mr76_objects(mr76)
 
     if raw_objects is None:
+      self.mr76_object_count = 0
       return objects
 
     try:
